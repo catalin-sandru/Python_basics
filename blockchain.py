@@ -1,6 +1,8 @@
-from functools import partial, reduce 
+from functools import reduce 
 import hashlib as hl
 import json
+from os import replace
+import requests
 
 from Utility.hash_util import hash_block
 from block import Block
@@ -18,15 +20,19 @@ class Blockchain:
     self.public_key = public_key
     self.__peer_nodes = set()
     self.node_id = node_id
+    self.resolve_conflicts = False
     self.load_data()
+
 
   @property
   def chain(self):
     return self.__chain[:]
 
+
   @chain.setter
   def chain(self, val):
     self.__chain = val
+
 
   def get_open_transactions(self):
     return self.__open_transactions[:]
@@ -74,6 +80,7 @@ class Blockchain:
     except IOError:
       print('Saving Failed!')
 
+
   def proof_of_work(self):
     last_block = self.__chain[-1]
     last_hash = hash_block(last_block)
@@ -83,11 +90,14 @@ class Blockchain:
     return proof
 
 
-  def get_balance(self):
-    if self.public_key == None:
-      return None
+  def get_balance(self, sender=None):
+    if sender == None:
+      if self.public_key == None:
+        return None
+      participant = self.public_key
+    else:
+      participant = sender
 
-    participant = self.public_key
     tx_sender = [[tx.amount for tx in block.transactions if tx.sender == participant] for block in self.__chain]
     open_tx_sender = [tx.amount for tx in self.__open_transactions if tx.sender == participant]
     tx_sender.append(open_tx_sender)
@@ -96,6 +106,7 @@ class Blockchain:
     amount_received = reduce(lambda tx_sum, tx_amt: tx_sum + sum(tx_amt) if len(tx_amt) > 0 else tx_sum + 0, tx_recipient, 0)
     return amount_received - amount_sent
 
+
   def get_last_blockchain_value(self):
     """ Returns the last value of the current blockchain. """
     if len(self.__chain) < 1:
@@ -103,7 +114,7 @@ class Blockchain:
     return self.__chain[-1]
   
 
-  def add_transaction(self, recipient, sender, signature, amount=1.0):
+  def add_transaction(self, recipient, sender, signature, amount=1.0, is_receiving=False):
     if self.public_key == None:
       return False
     transaction = Transaction(sender, recipient, signature, amount)
@@ -111,13 +122,24 @@ class Blockchain:
     if Verification.verify_transaction(transaction, self.get_balance):
       self.__open_transactions.append(transaction)
       self.save_data()
+
+      if not is_receiving:
+        for node in self.__peer_nodes:
+          url = 'http://{}/broadcast-transaction'.format(node)
+          try:
+            response = requests.post(url, json={'sender': sender, 'recipient': recipient, 'amount': amount, 'signature': signature})
+            if response.status_code == 400 or response.status_code == 500:
+              print('Transaction declined')
+              return False
+          except requests.exceptions.ConnectionError:
+            continue
       return True
     return False
 
 
   def mine_block(self):
-    if self.public_key == None:
-      return None
+    # if self.public_key == None:
+    #   return None
 
     last_block = self.__chain[-1]
     hashed_block = hash_block(last_block)
@@ -134,18 +156,80 @@ class Blockchain:
     self.__chain.append(block)
     self.__open_transactions = []
     self.save_data()
+
+    for node in self.__peer_nodes:
+      url = 'http://{}/broadcast-block'.format(node)
+      converted_block = block.__dict__.copy()
+      converted_block['transactions'] = [tx.__dict__ for tx in converted_block['transactions']]
+      try:
+        response = requests.post(url, json={'block': converted_block})
+        if response.status_code == 400 or response.status_code == 500:
+          print('Block declined')
+        if response.status_code == 409:
+          self.resolve_conflicts = True
+      except requests.exceptions.ConnectionError:
+        continue
     return block
 
+
+  def add_block(self, block):
+    transactions = [Transaction(tx['sender'], tx['recipient'], tx['signature'], tx['amount']) for tx in block['transactions']]
+    proof_is_valid = Verification.valid_proof(transactions[:-1], block['previous_hash'], block['proof'])
+    hashes_match = hash_block(self.chain[-1]) == block['previous_hash']
+    
+    if not proof_is_valid or not hashes_match:
+      return False
+    
+    converted_block = Block(block['index'], block['previous_hash'], transactions, block['proof'], block['timestamp'])
+    self.__chain.append(converted_block)
+    stored_transactions = self.__open_transactions[:]
+
+    for itx in block['transactions']:
+      for opentx in stored_transactions:
+        if opentx.sender == itx['sender'] and opentx.recipient == itx['recipient'] and opentx.amount == itx['amount'] and opentx.signature == itx['signature']:
+          try:
+            self.__open_transactions.remove(opentx)
+          except ValueError:
+            print('Value was already removed')
+    self.save_data()
+    return True
+
+
+  def resolve(self):
+    winner_chain = self.chain
+    replace = False
+    for node in self.__peer_nodes:
+      url = 'http://{}/chain'.format(node)
+      try:
+        response = requests.get(url)
+        node_chain = response.json()
+        node_chain = [Block(block['index'], block['previous_hash'], [Transaction(tx['sender'], tx['recipient'], tx['signature'], tx['amount']) for tx in block['transactions']], block['proof'], block['timestamp']) for block in node_chain]
+        # node_chain.transactions = 
+        node_chain_length = len(node_chain)
+        local_chain_length = len(winner_chain)
+        if node_chain_length > local_chain_length and Verification.verify_chain(node_chain):
+          winner_chain = node_chain
+          replace = True
+      except requests.exceptions.ConnectionError:
+        continue
+    self.resolve_conflicts = False
+    self.chain = winner_chain
+    if replace:
+      self.__open_transactions = []
+    self.save_data()
+    return replace
 
   def add_peer_node(self, node):
     """Add a new node to the peer set."""
     self.__peer_nodes.add(node)
     self.save_data()
 
+
   def remove_peer_node(self, node):
     """Remove a new node from the peer set."""
     self.__peer_nodes.discard(node)
     self.save_data()
+
 
   def get_peeer_nodes(self):
     return list(self.__peer_nodes)
